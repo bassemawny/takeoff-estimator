@@ -114,6 +114,7 @@ export default function PlanViewer() {
 
   // Tool mode
   const [mode, setMode] = useState<Mode>("pan");
+  const [spaceHeld, setSpaceHeld] = useState(false);
 
   // Scale calibration state
   const [calPoint1, setCalPoint1] = useState<Point | null>(null);
@@ -244,6 +245,14 @@ export default function PlanViewer() {
   function handlePointerDown(e: React.PointerEvent) {
     if (e.button !== 0 || showScaleDialog) return;
 
+    // Space held = always pan, regardless of active tool
+    if (spaceHeld) {
+      setIsPanning(true);
+      setPanStart({ x: e.clientX - offset.x, y: e.clientY - offset.y });
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      return;
+    }
+
     if (mode === "calibrate") {
       const pt = screenToImage(e.clientX, e.clientY);
       if (!pt) return;
@@ -269,6 +278,7 @@ export default function PlanViewer() {
   }
 
   function handleClick(e: React.MouseEvent) {
+    if (spaceHeld) return; // suppress clicks while space-panning
     if ((mode !== "measure" && mode !== "area") || showScaleDialog) return;
 
     const rawPt = screenToImage(e.clientX, e.clientY);
@@ -305,6 +315,12 @@ export default function PlanViewer() {
   }
 
   function handlePointerMove(e: React.PointerEvent) {
+    // Space-pan takes priority
+    if (isPanning) {
+      setOffset({ x: e.clientX - panStart.x, y: e.clientY - panStart.y });
+      return;
+    }
+
     if (mode === "calibrate" && calPoint1 && !calPoint2) {
       const pt = screenToImage(e.clientX, e.clientY);
       if (pt) setCalMousePos(pt);
@@ -320,9 +336,6 @@ export default function PlanViewer() {
       }
       return;
     }
-
-    if (!isPanning) return;
-    setOffset({ x: e.clientX - panStart.x, y: e.clientY - panStart.y });
   }
 
   function handlePointerUp() {
@@ -443,10 +456,35 @@ export default function PlanViewer() {
     }
   }
 
+  // --- Space-to-pan ---
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.key === " " && !e.repeat) {
+        e.preventDefault();
+        setSpaceHeld(true);
+      }
+    }
+    function onKeyUp(e: KeyboardEvent) {
+      if (e.key === " ") {
+        e.preventDefault();
+        setSpaceHeld(false);
+        setIsPanning(false);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, []);
+
   // --- Keyboard shortcuts ---
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.key === " ") return; // handled by space-to-pan
 
       // Mode-specific
       if (mode === "calibrate" && e.key === "Escape") {
@@ -840,7 +878,10 @@ export default function PlanViewer() {
 
   const zoomPercent = Math.round(zoom * 100);
   const scale = scaleLabel();
-  const cursor = mode === "calibrate" || mode === "measure" || mode === "area" ? "crosshair" : isPanning ? "grabbing" : "grab";
+  const cursor = spaceHeld
+    ? (isPanning ? "grabbing" : "grab")
+    : (mode === "calibrate" || mode === "measure" || mode === "area") ? "crosshair"
+    : isPanning ? "grabbing" : "grab";
 
   return (
     <div className="flex h-screen flex-col bg-zinc-900 text-white select-none">
