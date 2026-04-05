@@ -160,6 +160,84 @@ def save_scale(
     return scale_entry
 
 
+# --- Measurements ---
+
+def _measurements_path(plan_dir: Path) -> Path:
+    return plan_dir / "measurements.json"
+
+
+def _read_measurements(plan_dir: Path) -> dict:
+    path = _measurements_path(plan_dir)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def _write_measurements(plan_dir: Path, data: dict):
+    _measurements_path(plan_dir).write_text(json.dumps(data, indent=2))
+
+
+def list_measurements(plan_id: str, page_number: int) -> list[dict]:
+    plan_dir = _find_plan_dir(plan_id)
+    if not plan_dir:
+        return []
+    data = _read_measurements(plan_dir)
+    return data.get(str(page_number), [])
+
+
+def save_measurement(plan_id: str, page_number: int, measurement: dict) -> dict:
+    plan_dir = _find_plan_dir(plan_id)
+    if not plan_dir:
+        raise FileNotFoundError(f"Plan {plan_id} not found")
+
+    measurement["id"] = uuid.uuid4().hex[:12]
+    measurement["created_at"] = datetime.now(timezone.utc).isoformat()
+
+    data = _read_measurements(plan_dir)
+    page_key = str(page_number)
+    if page_key not in data:
+        data[page_key] = []
+    data[page_key].append(measurement)
+    _write_measurements(plan_dir, data)
+    return measurement
+
+
+def update_measurement(
+    plan_id: str, page_number: int, measurement_id: str, updates: dict
+) -> dict | None:
+    plan_dir = _find_plan_dir(plan_id)
+    if not plan_dir:
+        return None
+
+    data = _read_measurements(plan_dir)
+    page_key = str(page_number)
+    items = data.get(page_key, [])
+
+    for item in items:
+        if item["id"] == measurement_id:
+            item.update(updates)
+            _write_measurements(plan_dir, data)
+            return item
+    return None
+
+
+def delete_measurement(plan_id: str, page_number: int, measurement_id: str) -> bool:
+    plan_dir = _find_plan_dir(plan_id)
+    if not plan_dir:
+        return False
+
+    data = _read_measurements(plan_dir)
+    page_key = str(page_number)
+    items = data.get(page_key, [])
+    updated = [m for m in items if m["id"] != measurement_id]
+    if len(updated) == len(items):
+        return False
+
+    data[page_key] = updated
+    _write_measurements(plan_dir, data)
+    return True
+
+
 def delete_plan(project_id: str, plan_id: str) -> bool:
     plans = _read_plans_index(project_id)
     updated = [p for p in plans if p["id"] != plan_id]

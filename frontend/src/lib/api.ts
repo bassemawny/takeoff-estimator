@@ -96,3 +96,73 @@ export async function setScale(
   if (!res.ok) throw new Error("Failed to save scale");
   return res.json();
 }
+
+// --- Measurements ---
+
+export interface Measurement {
+  id: string;
+  type: string;
+  points: number[][];
+  label: string;
+  created_at: string;
+}
+
+export async function listMeasurements(
+  planId: string,
+  pageNumber: number
+): Promise<Measurement[]> {
+  const res = await fetch(
+    `${API_URL}/api/plans/${planId}/pages/${pageNumber}/measurements`
+  );
+  if (!res.ok) return [];
+  return res.json();
+}
+
+export async function createMeasurement(
+  planId: string,
+  pageNumber: number,
+  type: string,
+  points: number[][],
+  label: string = ""
+): Promise<Measurement> {
+  const res = await fetch(
+    `${API_URL}/api/plans/${planId}/pages/${pageNumber}/measurements`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type, points, label }),
+    }
+  );
+  if (!res.ok) throw new Error("Failed to save measurement");
+  return res.json();
+}
+
+export async function updateMeasurement(
+  planId: string,
+  pageNumber: number,
+  measurementId: string,
+  updates: { points?: number[][]; label?: string }
+): Promise<Measurement> {
+  const res = await fetch(
+    `${API_URL}/api/plans/${planId}/pages/${pageNumber}/measurements/${measurementId}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    }
+  );
+  if (!res.ok) throw new Error("Failed to update measurement");
+  return res.json();
+}
+
+export async function deleteMeasurement(
+  planId: string,
+  pageNumber: number,
+  measurementId: string
+): Promise<void> {
+  const res = await fetch(
+    `${API_URL}/api/plans/${planId}/pages/${pageNumber}/measurements/${measurementId}`,
+    { method: "DELETE" }
+  );
+  if (!res.ok) throw new Error("Failed to delete measurement");
+}

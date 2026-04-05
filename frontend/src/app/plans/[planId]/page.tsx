@@ -4,15 +4,20 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   type Scale,
+  type Measurement,
   getPlanPages,
   getPageImageUrl,
   getScale,
   setScale as saveScale,
+  listMeasurements,
+  createMeasurement,
+  deleteMeasurement as apiDeleteMeasurement,
 } from "@/lib/api";
 
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 5;
 const ZOOM_STEP = 0.15;
+const SNAP_RADIUS = 12; // pixels on screen
 
 const UNIT_LABELS: Record<string, string> = {
   ft: "feet",
@@ -22,6 +27,29 @@ const UNIT_LABELS: Record<string, string> = {
 };
 
 type Point = { x: number; y: number };
+type Mode = "pan" | "calibrate" | "measure";
+
+// Compute distance between two image-space points
+function ptDist(a: Point, b: Point): number {
+  return Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2);
+}
+
+// Total polyline length in image pixels
+function polylinePixelLength(points: Point[]): number {
+  let total = 0;
+  for (let i = 1; i < points.length; i++) {
+    total += ptDist(points[i - 1], points[i]);
+  }
+  return total;
+}
+
+// Format a real-world distance for display
+function formatDistance(pixels: number, scale: Scale | null): string {
+  if (!scale) return `${Math.round(pixels)} px`;
+  const real = pixels / scale.pixels_per_unit;
+  if (real < 0.01) return `0 ${UNIT_LABELS[scale.unit] || scale.unit}`;
+  return `${real < 10 ? real.toFixed(2) : real.toFixed(1)} ${UNIT_LABELS[scale.unit] || scale.unit}`;
+}
 
 export default function PlanViewer() {
   const { planId } = useParams<{ planId: string }>();
@@ -41,8 +69,10 @@ export default function PlanViewer() {
   const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
   const [sheetPanelOpen, setSheetPanelOpen] = useState(true);
 
+  // Tool mode
+  const [mode, setMode] = useState<Mode>("pan");
+
   // Scale calibration state
-  const [calibrating, setCalibrating] = useState(false);
   const [calPoint1, setCalPoint1] = useState<Point | null>(null);
   const [calPoint2, setCalPoint2] = useState<Point | null>(null);
   const [calMousePos, setCalMousePos] = useState<Point | null>(null);
@@ -51,6 +81,13 @@ export default function PlanViewer() {
   const [scaleUnit, setScaleUnit] = useState("ft");
   const [currentScale, setCurrentScale] = useState<Scale | null>(null);
   const [savingScale, setSavingScale] = useState(false);
+
+  // Measurement state
+  const [measurements, setMeasurements] = useState<Measurement[]>([]);
+  const [drawingPoints, setDrawingPoints] = useState<Point[]>([]);
+  const [measureMousePos, setMeasureMousePos] = useState<Point | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [snapPoint, setSnapPoint] = useState<Point | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -71,10 +108,11 @@ export default function PlanViewer() {
       });
   }, [planId]);
 
-  // Load scale for current page
+  // Load scale + measurements for current page
   useEffect(() => {
     if (!planId || pages.length === 0) return;
     getScale(planId, currentPage).then(setCurrentScale);
+    listMeasurements(planId, currentPage).then(setMeasurements);
   }, [planId, currentPage, pages.length]);
 
   // Zoom to fit
@@ -97,14 +135,13 @@ export default function PlanViewer() {
     if (imageSize.width > 0) zoomToFit();
   }, [imageSize, zoomToFit]);
 
-  // Convert screen coordinates to image-space coordinates
+  // Coordinate conversions
   function screenToImage(clientX: number, clientY: number): Point | null {
     const container = containerRef.current;
     if (!container || imageSize.width === 0) return null;
     const rect = container.getBoundingClientRect();
     const centerX = rect.left + rect.width / 2;
     const centerY = rect.top + rect.height / 2;
-    // Image top-left in screen space
     const imgScreenX = centerX + offset.x - (imageSize.width * zoom) / 2;
     const imgScreenY = centerY + offset.y - (imageSize.height * zoom) / 2;
     return {
@@ -113,7 +150,6 @@ export default function PlanViewer() {
     };
   }
 
-  // Convert image-space coordinates to the transform coordinate system for SVG overlay
   function imageToOverlay(pt: Point): Point {
     return {
       x: offset.x - (imageSize.width * zoom) / 2 + pt.x * zoom,
@@ -121,9 +157,28 @@ export default function PlanViewer() {
     };
   }
 
-  // Pixel distance between two image-space points
-  function pixelDistance(a: Point, b: Point): number {
-    return Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2);
+  // Find nearest snap point from all existing measurements
+  function findSnapPoint(imgPt: Point): Point | null {
+    let best: Point | null = null;
+    let bestScreenDist = Infinity;
+
+    const allPoints: Point[] = [];
+    for (const m of measurements) {
+      for (const p of m.points) {
+        allPoints.push({ x: p[0], y: p[1] });
+      }
+    }
+
+    for (const p of allPoints) {
+      const screenP = imageToOverlay(p);
+      const screenImg = imageToOverlay(imgPt);
+      const d = ptDist(screenP, screenImg);
+      if (d < SNAP_RADIUS && d < bestScreenDist) {
+        bestScreenDist = d;
+        best = p;
+      }
+    }
+    return best;
   }
 
   // Mouse wheel zoom
@@ -142,11 +197,11 @@ export default function PlanViewer() {
     setZoom(newZoom);
   }
 
-  // Pointer handlers — branch between pan mode and calibration mode
+  // --- Pointer handlers ---
   function handlePointerDown(e: React.PointerEvent) {
     if (e.button !== 0 || showScaleDialog) return;
 
-    if (calibrating) {
+    if (mode === "calibrate") {
       const pt = screenToImage(e.clientX, e.clientY);
       if (!pt) return;
       if (!calPoint1) {
@@ -159,17 +214,60 @@ export default function PlanViewer() {
       return;
     }
 
+    if (mode === "measure") {
+      // Single click adds a point; don't start panning
+      return;
+    }
+
+    // Pan mode
     setIsPanning(true);
     setPanStart({ x: e.clientX - offset.x, y: e.clientY - offset.y });
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
   }
 
+  function handleClick(e: React.MouseEvent) {
+    if (mode !== "measure" || showScaleDialog) return;
+
+    const rawPt = screenToImage(e.clientX, e.clientY);
+    if (!rawPt) return;
+    const pt = snapPoint || rawPt;
+
+    // If we're not drawing yet, check if user clicked on an existing measurement
+    if (drawingPoints.length === 0) {
+      const clicked = findClickedMeasurement(e.clientX, e.clientY);
+      if (clicked) {
+        setSelectedId(clicked.id === selectedId ? null : clicked.id);
+        return;
+      }
+      setSelectedId(null);
+    }
+
+    setDrawingPoints((prev) => [...prev, pt]);
+  }
+
+  function handleDoubleClick(e: React.MouseEvent) {
+    if (mode !== "measure") return;
+    e.preventDefault();
+    finishMeasurement();
+  }
+
   function handlePointerMove(e: React.PointerEvent) {
-    if (calibrating && calPoint1 && !calPoint2) {
+    if (mode === "calibrate" && calPoint1 && !calPoint2) {
       const pt = screenToImage(e.clientX, e.clientY);
       if (pt) setCalMousePos(pt);
       return;
     }
+
+    if (mode === "measure") {
+      const pt = screenToImage(e.clientX, e.clientY);
+      if (pt) {
+        const snap = findSnapPoint(pt);
+        setSnapPoint(snap);
+        setMeasureMousePos(snap || pt);
+      }
+      return;
+    }
+
     if (!isPanning) return;
     setOffset({ x: e.clientX - panStart.x, y: e.clientY - panStart.y });
   }
@@ -178,19 +276,45 @@ export default function PlanViewer() {
     setIsPanning(false);
   }
 
-  // Scale calibration actions
-  function startCalibration() {
-    setCalibrating(true);
-    setCalPoint1(null);
-    setCalPoint2(null);
-    setCalMousePos(null);
-    setShowScaleDialog(false);
-    setScaleDistance("");
-    setScaleUnit("ft");
+  // Find measurement near click
+  function findClickedMeasurement(clientX: number, clientY: number): Measurement | null {
+    const clickPt = screenToImage(clientX, clientY);
+    if (!clickPt) return null;
+
+    const threshold = 8 / zoom; // 8 screen pixels tolerance
+
+    for (const m of measurements) {
+      for (let i = 1; i < m.points.length; i++) {
+        const a = { x: m.points[i - 1][0], y: m.points[i - 1][1] };
+        const b = { x: m.points[i][0], y: m.points[i][1] };
+        const d = pointToSegmentDist(clickPt, a, b);
+        if (d < threshold) return m;
+      }
+    }
+    return null;
   }
 
+  function pointToSegmentDist(p: Point, a: Point, b: Point): number {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq === 0) return ptDist(p, a);
+    let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+    t = Math.max(0, Math.min(1, t));
+    return ptDist(p, { x: a.x + t * dx, y: a.y + t * dy });
+  }
+
+  // --- Mode switching ---
+  function switchMode(newMode: Mode) {
+    // Cancel any in-progress work
+    cancelCalibration();
+    cancelMeasurement();
+    setSelectedId(null);
+    setMode(newMode);
+  }
+
+  // --- Scale calibration ---
   function cancelCalibration() {
-    setCalibrating(false);
     setCalPoint1(null);
     setCalPoint2(null);
     setCalMousePos(null);
@@ -202,28 +326,88 @@ export default function PlanViewer() {
     const dist = parseFloat(scaleDistance);
     if (isNaN(dist) || dist <= 0) return;
 
-    const pxDist = pixelDistance(calPoint1, calPoint2);
+    const pxDist = ptDist(calPoint1, calPoint2);
     setSavingScale(true);
     try {
       const saved = await saveScale(planId, currentPage, pxDist, dist, scaleUnit);
       setCurrentScale(saved);
       cancelCalibration();
+      setMode("pan");
     } catch {
-      // keep dialog open on error
+      // keep dialog open
     } finally {
       setSavingScale(false);
     }
   }
 
-  // Keyboard shortcuts
+  // --- Measurements ---
+  function cancelMeasurement() {
+    setDrawingPoints([]);
+    setMeasureMousePos(null);
+    setSnapPoint(null);
+  }
+
+  async function finishMeasurement() {
+    if (drawingPoints.length < 2) return;
+    const points = drawingPoints.map((p) => [p.x, p.y]);
+    try {
+      const m = await createMeasurement(planId, currentPage, "line", points);
+      setMeasurements((prev) => [...prev, m]);
+    } catch {
+      // ignore
+    }
+    setDrawingPoints([]);
+    setMeasureMousePos(null);
+    setSnapPoint(null);
+  }
+
+  async function deleteSelected() {
+    if (!selectedId) return;
+    try {
+      await apiDeleteMeasurement(planId, currentPage, selectedId);
+      setMeasurements((prev) => prev.filter((m) => m.id !== selectedId));
+      setSelectedId(null);
+    } catch {
+      // ignore
+    }
+  }
+
+  // --- Keyboard shortcuts ---
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
-      if (calibrating && e.key === "Escape") {
+      // Mode-specific
+      if (mode === "calibrate" && e.key === "Escape") {
         e.preventDefault();
-        cancelCalibration();
+        switchMode("pan");
         return;
+      }
+      if (mode === "measure") {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          if (drawingPoints.length > 0) {
+            cancelMeasurement();
+          } else {
+            switchMode("pan");
+          }
+          return;
+        }
+        if (e.key === "Enter" && drawingPoints.length >= 2) {
+          e.preventDefault();
+          finishMeasurement();
+          return;
+        }
+        if ((e.key === "Delete" || e.key === "Backspace") && selectedId) {
+          e.preventDefault();
+          deleteSelected();
+          return;
+        }
+        if (e.key === "z" && (e.metaKey || e.ctrlKey) && drawingPoints.length > 0) {
+          e.preventDefault();
+          setDrawingPoints((prev) => prev.slice(0, -1));
+          return;
+        }
       }
 
       switch (e.key) {
@@ -259,6 +443,10 @@ export default function PlanViewer() {
           e.preventDefault();
           setSheetPanelOpen((o) => !o);
           break;
+        case "l":
+          e.preventDefault();
+          switchMode(mode === "measure" ? "pan" : "measure");
+          break;
         case "Escape":
           router.push("/");
           break;
@@ -268,48 +456,161 @@ export default function PlanViewer() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pages.length, zoomToFit, router, calibrating]);
+  }, [pages.length, zoomToFit, router, mode, drawingPoints, selectedId]);
 
-  // Reset view when page changes
+  // Reset state when page changes
   useEffect(() => {
     setOffset({ x: 0, y: 0 });
     setImageSize({ width: 0, height: 0 });
     cancelCalibration();
+    cancelMeasurement();
+    setSelectedId(null);
+    setMode("pan");
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentPage]);
 
-  // Build SVG overlay for calibration line
+  // --- SVG rendering helpers ---
+
+  // Convert image-space point to absolute SVG coordinates
+  function toSvg(pt: Point): Point {
+    const el = containerRef.current;
+    if (!el) return { x: 0, y: 0 };
+    const o = imageToOverlay(pt);
+    return { x: el.clientWidth / 2 + o.x, y: el.clientHeight / 2 + o.y };
+  }
+
+  function svgMidpoint(a: Point, b: Point): Point {
+    return toSvg({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  }
+
+  // Render saved measurements
+  function renderMeasurements() {
+    if (measurements.length === 0) return null;
+
+    return measurements.map((m) => {
+      const isSelected = m.id === selectedId;
+      const color = isSelected ? "#60a5fa" : "#10b981";
+      const pts = m.points.map((p) => ({ x: p[0], y: p[1] }));
+      const totalPx = polylinePixelLength(pts);
+
+      return (
+        <g key={m.id}>
+          {pts.slice(1).map((pt, i) => {
+            const prev = pts[i];
+            const s1 = toSvg(prev);
+            const s2 = toSvg(pt);
+            const mid = svgMidpoint(prev, pt);
+            const segLabel = formatDistance(ptDist(prev, pt), currentScale);
+            const labelW = segLabel.length * 6.5 + 8;
+            return (
+              <g key={i}>
+                <line x1={s1.x} y1={s1.y} x2={s2.x} y2={s2.y} stroke={color} strokeWidth={isSelected ? 3 : 2} strokeLinecap="round" />
+                <rect x={mid.x - labelW / 2} y={mid.y - 22} width={labelW} height={16} rx={3} fill="rgba(0,0,0,0.7)" />
+                <text x={mid.x} y={mid.y - 10} fill={color} fontSize={11} fontWeight={500} textAnchor="middle">{segLabel}</text>
+              </g>
+            );
+          })}
+          {pts.map((pt, i) => {
+            const s = toSvg(pt);
+            return <circle key={i} cx={s.x} cy={s.y} r={4} fill={color} stroke="white" strokeWidth={1} />;
+          })}
+          {pts.length > 2 && (() => {
+            const last = toSvg(pts[pts.length - 1]);
+            const label = `Total: ${formatDistance(totalPx, currentScale)}`;
+            const labelW = label.length * 7 + 8;
+            return (
+              <g>
+                <rect x={last.x + 8} y={last.y + 6} width={labelW} height={18} rx={3} fill="rgba(0,0,0,0.75)" />
+                <text x={last.x + 12} y={last.y + 19} fill={color} fontSize={12} fontWeight={700}>{label}</text>
+              </g>
+            );
+          })()}
+        </g>
+      );
+    });
+  }
+
+  // Render in-progress drawing
+  function renderDrawing() {
+    if (mode !== "measure" || drawingPoints.length === 0) return null;
+
+    const allPts = [...drawingPoints];
+    const mouseTarget = measureMousePos;
+    const color = "#22d3ee";
+
+    return (
+      <g>
+        {allPts.slice(1).map((pt, i) => {
+          const prev = allPts[i];
+          const s1 = toSvg(prev);
+          const s2 = toSvg(pt);
+          const mid = svgMidpoint(prev, pt);
+          const segLabel = formatDistance(ptDist(prev, pt), currentScale);
+          const labelW = segLabel.length * 6.5 + 8;
+          return (
+            <g key={i}>
+              <line x1={s1.x} y1={s1.y} x2={s2.x} y2={s2.y} stroke={color} strokeWidth={2} strokeLinecap="round" />
+              <rect x={mid.x - labelW / 2} y={mid.y - 22} width={labelW} height={16} rx={3} fill="rgba(0,0,0,0.7)" />
+              <text x={mid.x} y={mid.y - 10} fill={color} fontSize={11} fontWeight={500} textAnchor="middle">{segLabel}</text>
+            </g>
+          );
+        })}
+        {mouseTarget && (() => {
+          const s1 = toSvg(allPts[allPts.length - 1]);
+          const s2 = toSvg(mouseTarget);
+          const mid = svgMidpoint(allPts[allPts.length - 1], mouseTarget);
+          const rbLabel = formatDistance(ptDist(allPts[allPts.length - 1], mouseTarget), currentScale);
+          const rbW = rbLabel.length * 6.5 + 8;
+          return (
+            <g>
+              <line x1={s1.x} y1={s1.y} x2={s2.x} y2={s2.y} stroke={color} strokeWidth={2} strokeDasharray="6 3" strokeLinecap="round" />
+              <rect x={mid.x - rbW / 2} y={mid.y - 22} width={rbW} height={16} rx={3} fill="rgba(0,0,0,0.7)" />
+              <text x={mid.x} y={mid.y - 10} fill={color} fontSize={11} fontWeight={500} textAnchor="middle">{rbLabel}</text>
+            </g>
+          );
+        })()}
+        {allPts.map((pt, i) => {
+          const s = toSvg(pt);
+          return <circle key={i} cx={s.x} cy={s.y} r={4} fill={color} stroke="white" strokeWidth={1} />;
+        })}
+        {snapPoint && (() => {
+          const s = toSvg(snapPoint);
+          return <circle cx={s.x} cy={s.y} r={8} fill="none" stroke="#f59e0b" strokeWidth={2} />;
+        })()}
+        {allPts.length >= 2 && mouseTarget && (() => {
+          const totalPx = polylinePixelLength(allPts) + ptDist(allPts[allPts.length - 1], mouseTarget);
+          const last = toSvg(mouseTarget);
+          const label = `Total: ${formatDistance(totalPx, currentScale)}`;
+          const labelW = label.length * 7 + 8;
+          return (
+            <g>
+              <rect x={last.x + 8} y={last.y + 6} width={labelW} height={18} rx={3} fill="rgba(0,0,0,0.75)" />
+              <text x={last.x + 12} y={last.y + 19} fill={color} fontSize={12} fontWeight={700}>{label}</text>
+            </g>
+          );
+        })()}
+      </g>
+    );
+  }
+
+  // Render calibration overlay
   function renderCalibrationOverlay() {
-    if (!calibrating || !calPoint1) return null;
+    if (mode !== "calibrate" || !calPoint1) return null;
 
     const endPoint = calPoint2 || calMousePos;
     if (!endPoint) {
-      // Just show the first point
-      const p = imageToOverlay(calPoint1);
-      return (
-        <svg className="pointer-events-none absolute inset-0 h-full w-full">
-          <circle cx={`calc(50% + ${p.x}px)`} cy={`calc(50% + ${p.y}px)`} r={5} fill="#f59e0b" />
-        </svg>
-      );
+      const s = toSvg(calPoint1);
+      return <circle cx={s.x} cy={s.y} r={5} fill="#f59e0b" />;
     }
 
-    const p1 = imageToOverlay(calPoint1);
-    const p2 = imageToOverlay(endPoint);
-
+    const s1 = toSvg(calPoint1);
+    const s2 = toSvg(endPoint);
     return (
-      <svg className="pointer-events-none absolute inset-0 h-full w-full">
-        <line
-          x1={`calc(50% + ${p1.x}px)`}
-          y1={`calc(50% + ${p1.y}px)`}
-          x2={`calc(50% + ${p2.x}px)`}
-          y2={`calc(50% + ${p2.y}px)`}
-          stroke="#f59e0b"
-          strokeWidth={2}
-          strokeDasharray="6 3"
-        />
-        <circle cx={`calc(50% + ${p1.x}px)`} cy={`calc(50% + ${p1.y}px)`} r={5} fill="#f59e0b" />
-        <circle cx={`calc(50% + ${p2.x}px)`} cy={`calc(50% + ${p2.y}px)`} r={5} fill="#f59e0b" />
-      </svg>
+      <g>
+        <line x1={s1.x} y1={s1.y} x2={s2.x} y2={s2.y} stroke="#f59e0b" strokeWidth={2} strokeDasharray="6 3" />
+        <circle cx={s1.x} cy={s1.y} r={5} fill="#f59e0b" />
+        <circle cx={s2.x} cy={s2.y} r={5} fill="#f59e0b" />
+      </g>
     );
   }
 
@@ -324,7 +625,6 @@ export default function PlanViewer() {
           <p className="mt-1 text-sm text-zinc-400">
             Enter the real-world length of the line you drew.
           </p>
-
           <div className="mt-4 flex gap-2">
             <input
               ref={distanceInputRef}
@@ -348,10 +648,9 @@ export default function PlanViewer() {
               <option value="cm">cm</option>
             </select>
           </div>
-
           <div className="mt-4 flex justify-end gap-2">
             <button
-              onClick={cancelCalibration}
+              onClick={() => { cancelCalibration(); setMode("pan"); }}
               className="rounded px-3 py-1.5 text-sm text-zinc-300 hover:bg-zinc-700"
             >
               Cancel
@@ -369,15 +668,13 @@ export default function PlanViewer() {
     );
   }
 
-  // Format scale for display
+  // Format scale for toolbar
   function scaleLabel(): string | null {
     if (!currentScale) return null;
     const { real_distance, unit, pixel_distance } = currentScale;
-    // Express as "1 inch on plan = X unit"
-    // pixel_distance was at native image resolution (144 DPI), so 1 inch on paper = 144 px
     const pxPerInch = 144;
     const realPerInch = (pxPerInch / pixel_distance) * real_distance;
-    return `1″ = ${realPerInch.toFixed(1)} ${UNIT_LABELS[unit] || unit}`;
+    return `1\u2033 = ${realPerInch.toFixed(1)} ${UNIT_LABELS[unit] || unit}`;
   }
 
   if (loading) {
@@ -404,6 +701,7 @@ export default function PlanViewer() {
 
   const zoomPercent = Math.round(zoom * 100);
   const scale = scaleLabel();
+  const cursor = mode === "calibrate" || mode === "measure" ? "crosshair" : isPanning ? "grabbing" : "grab";
 
   return (
     <div className="flex h-screen flex-col bg-zinc-900 text-white select-none">
@@ -429,6 +727,7 @@ export default function PlanViewer() {
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Zoom controls */}
           <button
             onClick={() => setZoom((z) => Math.max(MIN_ZOOM, z * (1 - ZOOM_STEP)))}
             className="rounded px-2 py-1 text-sm text-zinc-300 hover:bg-zinc-700"
@@ -459,16 +758,29 @@ export default function PlanViewer() {
           >
             100%
           </button>
+
           <div className="mx-1 h-4 w-px bg-zinc-600" />
+
+          {/* Tool buttons */}
           <button
-            onClick={calibrating ? cancelCalibration : startCalibration}
+            onClick={() => switchMode("calibrate")}
             className={`rounded px-2 py-1 text-sm font-medium hover:bg-zinc-700 ${
-              calibrating ? "bg-amber-600 text-white" : "text-amber-400"
+              mode === "calibrate" ? "bg-amber-600 text-white" : "text-amber-400"
             }`}
             title="Set scale — draw a line over a known dimension"
           >
-            {calibrating ? "Cancel Scale" : "Set Scale"}
+            Scale
           </button>
+          <button
+            onClick={() => switchMode(mode === "measure" ? "pan" : "measure")}
+            className={`rounded px-2 py-1 text-sm font-medium hover:bg-zinc-700 ${
+              mode === "measure" ? "bg-emerald-600 text-white" : "text-emerald-400"
+            }`}
+            title="Linear measurement (L)"
+          >
+            Line
+          </button>
+
           <div className="mx-1 h-4 w-px bg-zinc-600" />
           <button
             onClick={() => setSheetPanelOpen((o) => !o)}
@@ -499,12 +811,28 @@ export default function PlanViewer() {
         </div>
       </div>
 
-      {/* Calibration banner */}
-      {calibrating && !showScaleDialog && (
+      {/* Context banner */}
+      {mode === "calibrate" && !showScaleDialog && (
         <div className="bg-amber-600/90 px-4 py-2 text-center text-sm font-medium text-white">
           {!calPoint1
             ? "Click the first point of a known dimension on the plan"
             : "Click the second point to complete the line"}
+        </div>
+      )}
+      {mode === "measure" && drawingPoints.length === 0 && !selectedId && (
+        <div className="bg-emerald-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+          Click to start measuring. Double-click or Enter to finish. Esc to cancel.
+          {!currentScale && " (Set scale first for real-world units)"}
+        </div>
+      )}
+      {mode === "measure" && drawingPoints.length > 0 && (
+        <div className="bg-emerald-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+          Click to add points. Double-click or Enter to finish. Ctrl+Z to undo last point.
+        </div>
+      )}
+      {mode === "measure" && selectedId && drawingPoints.length === 0 && (
+        <div className="bg-blue-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+          Measurement selected. Press Delete to remove. Click elsewhere to deselect.
         </div>
       )}
 
@@ -537,15 +865,17 @@ export default function PlanViewer() {
           </div>
         )}
 
-        {/* Viewer canvas */}
+        {/* Viewer */}
         <div
           ref={containerRef}
           className="relative flex-1 overflow-hidden"
-          style={{ cursor: calibrating ? "crosshair" : isPanning ? "grabbing" : "grab" }}
+          style={{ cursor }}
           onWheel={handleWheel}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
+          onClick={handleClick}
+          onDoubleClick={handleDoubleClick}
         >
           <div
             className="absolute left-1/2 top-1/2"
@@ -565,8 +895,12 @@ export default function PlanViewer() {
             />
           </div>
 
-          {/* Calibration line overlay */}
-          {renderCalibrationOverlay()}
+          {/* SVG overlay for all annotations */}
+          <svg className="pointer-events-none absolute inset-0 h-full w-full">
+            {renderMeasurements()}
+            {renderDrawing()}
+            {renderCalibrationOverlay()}
+          </svg>
 
           {/* Scale dialog */}
           {renderScaleDialog()}
@@ -580,15 +914,22 @@ export default function PlanViewer() {
           <span className="mr-4">Drag to pan</span>
           <span className="mr-4"><kbd>F</kbd> Fit</span>
           <span className="mr-4"><kbd>0</kbd> 100%</span>
-          <span className="mr-4"><kbd>+/-</kbd> Zoom</span>
+          <span className="mr-4"><kbd>L</kbd> Line tool</span>
           <span className="mr-4"><kbd>&larr;&rarr;</kbd> Sheets</span>
           <span><kbd>S</kbd> Toggle panel</span>
         </div>
-        {currentScale && (
-          <span className="text-amber-500/70">
-            Scale: {currentScale.real_distance} {UNIT_LABELS[currentScale.unit] || currentScale.unit} per {Math.round(currentScale.pixel_distance)} px
-          </span>
-        )}
+        <div className="flex items-center gap-4">
+          {measurements.length > 0 && (
+            <span className="text-emerald-500/70">
+              {measurements.length} measurement{measurements.length !== 1 ? "s" : ""}
+            </span>
+          )}
+          {currentScale && (
+            <span className="text-amber-500/70">
+              Scale: {currentScale.real_distance} {UNIT_LABELS[currentScale.unit] || currentScale.unit} per {Math.round(currentScale.pixel_distance)} px
+            </span>
+          )}
+        </div>
       </div>
     </div>
   );

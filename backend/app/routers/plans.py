@@ -1,3 +1,5 @@
+from typing import List, Optional
+
 from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -88,6 +90,56 @@ def set_scale(plan_id: str, page_number: int, body: ScaleInput):
         )
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Plan not found")
+
+
+class MeasurementInput(BaseModel):
+    type: str  # "line"
+    points: List[List[float]]  # [[x, y], [x, y], ...]
+    label: str = ""
+
+
+class MeasurementUpdate(BaseModel):
+    points: Optional[List[List[float]]] = None
+    label: Optional[str] = None
+
+
+@router.get("/plans/{plan_id}/pages/{page_number}/measurements")
+def list_measurements(plan_id: str, page_number: int):
+    return pdf_service.list_measurements(plan_id, page_number)
+
+
+@router.post("/plans/{plan_id}/pages/{page_number}/measurements")
+def create_measurement(plan_id: str, page_number: int, body: MeasurementInput):
+    try:
+        return pdf_service.save_measurement(plan_id, page_number, {
+            "type": body.type,
+            "points": body.points,
+            "label": body.label,
+        })
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+
+@router.put("/plans/{plan_id}/pages/{page_number}/measurements/{measurement_id}")
+def update_measurement(
+    plan_id: str, page_number: int, measurement_id: str, body: MeasurementUpdate
+):
+    updates = {}
+    if body.points is not None:
+        updates["points"] = body.points
+    if body.label is not None:
+        updates["label"] = body.label
+    result = pdf_service.update_measurement(plan_id, page_number, measurement_id, updates)
+    if not result:
+        raise HTTPException(status_code=404, detail="Measurement not found")
+    return result
+
+
+@router.delete("/plans/{plan_id}/pages/{page_number}/measurements/{measurement_id}")
+def delete_measurement(plan_id: str, page_number: int, measurement_id: str):
+    if not pdf_service.delete_measurement(plan_id, page_number, measurement_id):
+        raise HTTPException(status_code=404, detail="Measurement not found")
+    return {"status": "deleted"}
 
 
 @router.delete("/plans/{plan_id}")
