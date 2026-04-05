@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { type Plan, uploadPlan, listPlans, deletePlan, getPageImageUrl } from "@/lib/api";
+import Link from "next/link";
+import { type Plan, uploadPlan, listPlans, deletePlan } from "@/lib/api";
 
 const PROJECT_ID = "default";
 
@@ -90,14 +91,12 @@ export default function Home() {
                     </p>
                   </div>
                   <div className="flex items-center gap-3">
-                    <a
-                      href={getPageImageUrl(plan.id, 1)}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <Link
+                      href={`/plans/${plan.id}`}
                       className="text-sm text-blue-600 hover:underline"
                     >
-                      View page 1
-                    </a>
+                      View
+                    </Link>
                     <button
                       onClick={() => handleDelete(plan.id)}
                       className="text-sm text-red-500 hover:underline"

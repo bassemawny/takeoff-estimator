@@ -44,3 +44,15 @@ export async function deletePlan(planId: string, projectId: string = "default"):
 export function getPageImageUrl(planId: string, pageNumber: number): string {
   return `${API_URL}/api/plans/${planId}/pages/${pageNumber}`;
 }
+
+export interface PlanPages {
+  plan_id: string;
+  page_count: number;
+  pages: number[];
+}
+
+export async function getPlanPages(planId: string): Promise<PlanPages> {
+  const res = await fetch(`${API_URL}/api/plans/${planId}/pages`);
+  if (!res.ok) throw new Error("Failed to fetch plan pages");
+  return res.json();
+}
