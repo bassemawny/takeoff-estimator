@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from app.services import pdf_service
 
@@ -54,6 +55,39 @@ def get_page_image(plan_id: str, page_number: int):
     if not path:
         raise HTTPException(status_code=404, detail="Page not found")
     return FileResponse(path, media_type="image/png")
+
+
+class ScaleInput(BaseModel):
+    pixel_distance: float
+    real_distance: float
+    unit: str  # "ft", "in", "m", "cm"
+
+
+@router.get("/plans/{plan_id}/scale")
+def get_all_scales(plan_id: str):
+    return pdf_service.get_all_scales(plan_id)
+
+
+@router.get("/plans/{plan_id}/pages/{page_number}/scale")
+def get_scale(plan_id: str, page_number: int):
+    scale = pdf_service.get_scale(plan_id, page_number)
+    if not scale:
+        raise HTTPException(status_code=404, detail="Scale not set for this page")
+    return scale
+
+
+@router.put("/plans/{plan_id}/pages/{page_number}/scale")
+def set_scale(plan_id: str, page_number: int, body: ScaleInput):
+    if body.real_distance <= 0:
+        raise HTTPException(status_code=400, detail="Distance must be positive")
+    if body.unit not in ("ft", "in", "m", "cm"):
+        raise HTTPException(status_code=400, detail="Unit must be ft, in, m, or cm")
+    try:
+        return pdf_service.save_scale(
+            plan_id, page_number, body.pixel_distance, body.real_distance, body.unit
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Plan not found")
 
 
 @router.delete("/plans/{plan_id}")

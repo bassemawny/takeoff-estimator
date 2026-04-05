@@ -56,3 +56,43 @@ export async function getPlanPages(planId: string): Promise<PlanPages> {
   if (!res.ok) throw new Error("Failed to fetch plan pages");
   return res.json();
 }
+
+export interface Scale {
+  pixel_distance: number;
+  real_distance: number;
+  unit: string;
+  pixels_per_unit: number;
+}
+
+export async function getScale(planId: string, pageNumber: number): Promise<Scale | null> {
+  const res = await fetch(`${API_URL}/api/plans/${planId}/pages/${pageNumber}/scale`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("Failed to fetch scale");
+  return res.json();
+}
+
+export async function getAllScales(planId: string): Promise<Record<string, Scale>> {
+  const res = await fetch(`${API_URL}/api/plans/${planId}/scale`);
+  if (!res.ok) return {};
+  return res.json();
+}
+
+export async function setScale(
+  planId: string,
+  pageNumber: number,
+  pixelDistance: number,
+  realDistance: number,
+  unit: string
+): Promise<Scale> {
+  const res = await fetch(`${API_URL}/api/plans/${planId}/pages/${pageNumber}/scale`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      pixel_distance: pixelDistance,
+      real_distance: realDistance,
+      unit,
+    }),
+  });
+  if (!res.ok) throw new Error("Failed to save scale");
+  return res.json();
+}

@@ -98,6 +98,68 @@ def get_page_image_path(plan_id: str, page_number: int) -> Path | None:
     return None
 
 
+def _find_plan_dir(plan_id: str) -> Path | None:
+    """Find plan directory across all projects."""
+    if not UPLOADS_DIR.exists():
+        return None
+    for project_dir in UPLOADS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        plan_dir = project_dir / plan_id
+        if plan_dir.is_dir():
+            return plan_dir
+    return None
+
+
+def get_scale(plan_id: str, page_number: int) -> dict | None:
+    plan_dir = _find_plan_dir(plan_id)
+    if not plan_dir:
+        return None
+    scale_path = plan_dir / "scale.json"
+    if not scale_path.exists():
+        return None
+    scales = json.loads(scale_path.read_text())
+    return scales.get(str(page_number))
+
+
+def get_all_scales(plan_id: str) -> dict:
+    plan_dir = _find_plan_dir(plan_id)
+    if not plan_dir:
+        return {}
+    scale_path = plan_dir / "scale.json"
+    if not scale_path.exists():
+        return {}
+    return json.loads(scale_path.read_text())
+
+
+def save_scale(
+    plan_id: str,
+    page_number: int,
+    pixel_distance: float,
+    real_distance: float,
+    unit: str,
+) -> dict:
+    plan_dir = _find_plan_dir(plan_id)
+    if not plan_dir:
+        raise FileNotFoundError(f"Plan {plan_id} not found")
+
+    scale_path = plan_dir / "scale.json"
+    scales: dict = {}
+    if scale_path.exists():
+        scales = json.loads(scale_path.read_text())
+
+    pixels_per_unit = pixel_distance / real_distance
+    scale_entry = {
+        "pixel_distance": pixel_distance,
+        "real_distance": real_distance,
+        "unit": unit,
+        "pixels_per_unit": pixels_per_unit,
+    }
+    scales[str(page_number)] = scale_entry
+    scale_path.write_text(json.dumps(scales, indent=2))
+    return scale_entry
+
+
 def delete_plan(project_id: str, plan_id: str) -> bool:
     plans = _read_plans_index(project_id)
     updated = [p for p in plans if p["id"] != plan_id]
