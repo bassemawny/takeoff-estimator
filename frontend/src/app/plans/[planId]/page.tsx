@@ -613,6 +613,9 @@ export default function PlanViewer() {
       const color = isSelected ? "#60a5fa" : "#10b981";
       const totalPx = polylinePixelLength(pts);
 
+      // Scale labels with zoom: full size at zoom >= 1, shrink proportionally below
+      const labelScale = Math.min(1, zoom);
+
       return (
         <g key={m.id}>
           {pts.slice(1).map((pt, i) => {
@@ -625,8 +628,10 @@ export default function PlanViewer() {
             return (
               <g key={i}>
                 <line x1={s1.x} y1={s1.y} x2={s2.x} y2={s2.y} stroke={color} strokeWidth={isSelected ? 3 : 2} strokeLinecap="round" />
-                <rect x={mid.x - labelW / 2} y={mid.y - 22} width={labelW} height={16} rx={3} fill="rgba(0,0,0,0.7)" />
-                <text x={mid.x} y={mid.y - 10} fill={color} fontSize={11} fontWeight={500} textAnchor="middle">{segLabel}</text>
+                <g transform={`translate(${mid.x}, ${mid.y - 14}) scale(${labelScale}) translate(${-mid.x}, ${-(mid.y - 14)})`}>
+                  <rect x={mid.x - labelW / 2} y={mid.y - 22} width={labelW} height={16} rx={3} fill="rgba(0,0,0,0.7)" />
+                  <text x={mid.x} y={mid.y - 10} fill={color} fontSize={11} fontWeight={500} textAnchor="middle">{segLabel}</text>
+                </g>
               </g>
             );
           })}
@@ -638,8 +643,10 @@ export default function PlanViewer() {
             const last = toSvg(pts[pts.length - 1]);
             const label = `Total: ${formatDistance(totalPx, currentScale)}`;
             const labelW = label.length * 7 + 8;
+            const cx = last.x + 8 + labelW / 2;
+            const cy = last.y + 6 + 9;
             return (
-              <g>
+              <g transform={`translate(${cx}, ${cy}) scale(${labelScale}) translate(${-cx}, ${-cy})`}>
                 <rect x={last.x + 8} y={last.y + 6} width={labelW} height={18} rx={3} fill="rgba(0,0,0,0.75)" />
                 <text x={last.x + 12} y={last.y + 19} fill={color} fontSize={12} fontWeight={700}>{label}</text>
               </g>
@@ -664,6 +671,9 @@ export default function PlanViewer() {
     const mainLabelW = areaLabel.length * 7.5 + 10;
     const perimLabelW = perimLabel.length * 6.5 + 8;
 
+    // Scale labels with zoom: full size at zoom >= 1, shrink proportionally below
+    const labelScale = Math.min(1, zoom);
+
     return (
       <g key={key}>
         <polygon points={polyStr} fill={fillColor} stroke={color} strokeWidth={isSelected ? 3 : 2} strokeLinejoin="round" />
@@ -676,7 +686,7 @@ export default function PlanViewer() {
           const edgeLabel = formatDistance(ptDist(pt, next), currentScale);
           const edgeLabelW = edgeLabel.length * 6.5 + 8;
           return (
-            <g key={`edge-${i}`}>
+            <g key={`edge-${i}`} transform={`translate(${mid.x}, ${mid.y - 14}) scale(${labelScale}) translate(${-mid.x}, ${-(mid.y - 14)})`}>
               <rect x={mid.x - edgeLabelW / 2} y={mid.y - 22} width={edgeLabelW} height={16} rx={3} fill="rgba(0,0,0,0.7)" />
               <text x={mid.x} y={mid.y - 10} fill={color} fontSize={11} fontWeight={500} textAnchor="middle">{edgeLabel}</text>
             </g>
@@ -686,7 +696,7 @@ export default function PlanViewer() {
           <circle key={i} cx={s.x} cy={s.y} r={4} fill={color} stroke="white" strokeWidth={1} />
         ))}
         {pts.length >= 3 && (
-          <g>
+          <g transform={`translate(${center.x}, ${center.y}) scale(${labelScale}) translate(${-center.x}, ${-center.y})`}>
             <rect x={center.x - mainLabelW / 2} y={center.y - 24} width={mainLabelW} height={20} rx={4} fill="rgba(0,0,0,0.75)" />
             <text x={center.x} y={center.y - 10} fill={color} fontSize={13} fontWeight={700} textAnchor="middle">{areaLabel}</text>
             <rect x={center.x - perimLabelW / 2} y={center.y + 2} width={perimLabelW} height={16} rx={3} fill="rgba(0,0,0,0.7)" />
