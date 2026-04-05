@@ -667,6 +667,21 @@ export default function PlanViewer() {
     return (
       <g key={key}>
         <polygon points={polyStr} fill={fillColor} stroke={color} strokeWidth={isSelected ? 3 : 2} strokeLinejoin="round" />
+        {/* Edge length labels */}
+        {pts.length >= 2 && pts.map((pt, i) => {
+          const next = pts[(i + 1) % pts.length];
+          // Skip closing edge for in-progress drawings with < 3 points
+          if (isDrawing && pts.length < 3 && i === pts.length - 1) return null;
+          const mid = svgMidpoint(pt, next);
+          const edgeLabel = formatDistance(ptDist(pt, next), currentScale);
+          const edgeLabelW = edgeLabel.length * 6.5 + 8;
+          return (
+            <g key={`edge-${i}`}>
+              <rect x={mid.x - edgeLabelW / 2} y={mid.y - 22} width={edgeLabelW} height={16} rx={3} fill="rgba(0,0,0,0.7)" />
+              <text x={mid.x} y={mid.y - 10} fill={color} fontSize={11} fontWeight={500} textAnchor="middle">{edgeLabel}</text>
+            </g>
+          );
+        })}
         {svgPts.map((s, i) => (
           <circle key={i} cx={s.x} cy={s.y} r={4} fill={color} stroke="white" strokeWidth={1} />
         ))}
