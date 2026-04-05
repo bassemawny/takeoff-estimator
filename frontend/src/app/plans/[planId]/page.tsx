@@ -26,8 +26,15 @@ const UNIT_LABELS: Record<string, string> = {
   cm: "centimeters",
 };
 
+const AREA_UNIT_LABELS: Record<string, string> = {
+  ft: "sq ft",
+  in: "sq in",
+  m: "sq m",
+  cm: "sq cm",
+};
+
 type Point = { x: number; y: number };
-type Mode = "pan" | "calibrate" | "measure";
+type Mode = "pan" | "calibrate" | "measure" | "area";
 
 // Compute distance between two image-space points
 function ptDist(a: Point, b: Point): number {
@@ -43,12 +50,48 @@ function polylinePixelLength(points: Point[]): number {
   return total;
 }
 
+// Polygon perimeter (closed loop)
+function polygonPerimeter(points: Point[]): number {
+  if (points.length < 2) return 0;
+  let total = polylinePixelLength(points);
+  total += ptDist(points[points.length - 1], points[0]);
+  return total;
+}
+
+// Polygon area via shoelace formula (image-space pixels squared)
+function polygonPixelArea(points: Point[]): number {
+  if (points.length < 3) return 0;
+  let sum = 0;
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(sum) / 2;
+}
+
+// Polygon centroid
+function polygonCentroid(points: Point[]): Point {
+  let cx = 0, cy = 0;
+  for (const p of points) { cx += p.x; cy += p.y; }
+  return { x: cx / points.length, y: cy / points.length };
+}
+
 // Format a real-world distance for display
 function formatDistance(pixels: number, scale: Scale | null): string {
   if (!scale) return `${Math.round(pixels)} px`;
   const real = pixels / scale.pixels_per_unit;
   if (real < 0.01) return `0 ${UNIT_LABELS[scale.unit] || scale.unit}`;
   return `${real < 10 ? real.toFixed(2) : real.toFixed(1)} ${UNIT_LABELS[scale.unit] || scale.unit}`;
+}
+
+// Format a real-world area for display
+function formatArea(pixelsSq: number, scale: Scale | null): string {
+  if (!scale) return `${Math.round(pixelsSq)} px²`;
+  const realSq = pixelsSq / (scale.pixels_per_unit ** 2);
+  const label = AREA_UNIT_LABELS[scale.unit] || `sq ${scale.unit}`;
+  if (realSq < 0.01) return `0 ${label}`;
+  return `${realSq < 10 ? realSq.toFixed(2) : realSq.toFixed(1)} ${label}`;
 }
 
 export default function PlanViewer() {
@@ -214,7 +257,7 @@ export default function PlanViewer() {
       return;
     }
 
-    if (mode === "measure") {
+    if (mode === "measure" || mode === "area") {
       // Single click adds a point; don't start panning
       return;
     }
@@ -226,7 +269,7 @@ export default function PlanViewer() {
   }
 
   function handleClick(e: React.MouseEvent) {
-    if (mode !== "measure" || showScaleDialog) return;
+    if ((mode !== "measure" && mode !== "area") || showScaleDialog) return;
 
     const rawPt = screenToImage(e.clientX, e.clientY);
     if (!rawPt) return;
@@ -242,11 +285,21 @@ export default function PlanViewer() {
       setSelectedId(null);
     }
 
+    // Area mode: close polygon when clicking near first point
+    if (mode === "area" && drawingPoints.length >= 3) {
+      const firstSvg = imageToOverlay(drawingPoints[0]);
+      const clickSvg = imageToOverlay(pt);
+      if (ptDist(firstSvg, clickSvg) < SNAP_RADIUS) {
+        finishMeasurement();
+        return;
+      }
+    }
+
     setDrawingPoints((prev) => [...prev, pt]);
   }
 
   function handleDoubleClick(e: React.MouseEvent) {
-    if (mode !== "measure") return;
+    if (mode !== "measure" && mode !== "area") return;
     e.preventDefault();
     finishMeasurement();
   }
@@ -258,7 +311,7 @@ export default function PlanViewer() {
       return;
     }
 
-    if (mode === "measure") {
+    if (mode === "measure" || mode === "area") {
       const pt = screenToImage(e.clientX, e.clientY);
       if (pt) {
         const snap = findSnapPoint(pt);
@@ -281,17 +334,33 @@ export default function PlanViewer() {
     const clickPt = screenToImage(clientX, clientY);
     if (!clickPt) return null;
 
-    const threshold = 8 / zoom; // 8 screen pixels tolerance
+    const threshold = 8 / zoom;
 
     for (const m of measurements) {
-      for (let i = 1; i < m.points.length; i++) {
-        const a = { x: m.points[i - 1][0], y: m.points[i - 1][1] };
-        const b = { x: m.points[i][0], y: m.points[i][1] };
-        const d = pointToSegmentDist(clickPt, a, b);
-        if (d < threshold) return m;
+      const pts = m.points.map((p) => ({ x: p[0], y: p[1] }));
+      // For areas, check if point is inside the polygon
+      if (m.type === "area" && pointInPolygon(clickPt, pts)) return m;
+      // Check edges (including closing edge for areas)
+      const edgeCount = m.type === "area" ? pts.length : pts.length - 1;
+      for (let i = 0; i < edgeCount; i++) {
+        const a = pts[i];
+        const b = pts[(i + 1) % pts.length];
+        if (pointToSegmentDist(clickPt, a, b) < threshold) return m;
       }
     }
     return null;
+  }
+
+  function pointInPolygon(pt: Point, poly: Point[]): boolean {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const yi = poly[i].y, yj = poly[j].y;
+      const xi = poly[i].x, xj = poly[j].x;
+      if ((yi > pt.y) !== (yj > pt.y) && pt.x < ((xj - xi) * (pt.y - yi)) / (yj - yi) + xi) {
+        inside = !inside;
+      }
+    }
+    return inside;
   }
 
   function pointToSegmentDist(p: Point, a: Point, b: Point): number {
@@ -348,10 +417,12 @@ export default function PlanViewer() {
   }
 
   async function finishMeasurement() {
-    if (drawingPoints.length < 2) return;
+    const minPoints = mode === "area" ? 3 : 2;
+    if (drawingPoints.length < minPoints) return;
     const points = drawingPoints.map((p) => [p.x, p.y]);
+    const type = mode === "area" ? "area" : "line";
     try {
-      const m = await createMeasurement(planId, currentPage, "line", points);
+      const m = await createMeasurement(planId, currentPage, type, points);
       setMeasurements((prev) => [...prev, m]);
     } catch {
       // ignore
@@ -383,7 +454,7 @@ export default function PlanViewer() {
         switchMode("pan");
         return;
       }
-      if (mode === "measure") {
+      if (mode === "measure" || mode === "area") {
         if (e.key === "Escape") {
           e.preventDefault();
           if (drawingPoints.length > 0) {
@@ -393,7 +464,8 @@ export default function PlanViewer() {
           }
           return;
         }
-        if (e.key === "Enter" && drawingPoints.length >= 2) {
+        const minToFinish = mode === "area" ? 3 : 2;
+        if (e.key === "Enter" && drawingPoints.length >= minToFinish) {
           e.preventDefault();
           finishMeasurement();
           return;
@@ -447,6 +519,10 @@ export default function PlanViewer() {
           e.preventDefault();
           switchMode(mode === "measure" ? "pan" : "measure");
           break;
+        case "a":
+          e.preventDefault();
+          switchMode(mode === "area" ? "pan" : "area");
+          break;
         case "Escape":
           router.push("/");
           break;
@@ -489,8 +565,14 @@ export default function PlanViewer() {
 
     return measurements.map((m) => {
       const isSelected = m.id === selectedId;
-      const color = isSelected ? "#60a5fa" : "#10b981";
       const pts = m.points.map((p) => ({ x: p[0], y: p[1] }));
+
+      if (m.type === "area") {
+        return renderAreaMeasurement(m.id, pts, isSelected, false);
+      }
+
+      // Line measurement
+      const color = isSelected ? "#60a5fa" : "#10b981";
       const totalPx = polylinePixelLength(pts);
 
       return (
@@ -530,12 +612,69 @@ export default function PlanViewer() {
     });
   }
 
+  // Render a closed area polygon
+  function renderAreaMeasurement(key: string, pts: Point[], isSelected: boolean, isDrawing: boolean) {
+    const color = isDrawing ? "#a78bfa" : isSelected ? "#60a5fa" : "#8b5cf6"; // purple for areas
+    const fillColor = isDrawing ? "rgba(167,139,250,0.15)" : isSelected ? "rgba(96,165,250,0.2)" : "rgba(139,92,246,0.15)";
+    const svgPts = pts.map(toSvg);
+    const polyStr = svgPts.map((p) => `${p.x},${p.y}`).join(" ");
+    const areaPx = polygonPixelArea(pts);
+    const perimPx = polygonPerimeter(pts);
+    const center = toSvg(polygonCentroid(pts));
+    const areaLabel = formatArea(areaPx, currentScale);
+    const perimLabel = `Perim: ${formatDistance(perimPx, currentScale)}`;
+    const mainLabelW = areaLabel.length * 7.5 + 10;
+    const perimLabelW = perimLabel.length * 6.5 + 8;
+
+    return (
+      <g key={key}>
+        <polygon points={polyStr} fill={fillColor} stroke={color} strokeWidth={isSelected ? 3 : 2} strokeLinejoin="round" />
+        {svgPts.map((s, i) => (
+          <circle key={i} cx={s.x} cy={s.y} r={4} fill={color} stroke="white" strokeWidth={1} />
+        ))}
+        {pts.length >= 3 && (
+          <g>
+            <rect x={center.x - mainLabelW / 2} y={center.y - 24} width={mainLabelW} height={20} rx={4} fill="rgba(0,0,0,0.75)" />
+            <text x={center.x} y={center.y - 10} fill={color} fontSize={13} fontWeight={700} textAnchor="middle">{areaLabel}</text>
+            <rect x={center.x - perimLabelW / 2} y={center.y + 2} width={perimLabelW} height={16} rx={3} fill="rgba(0,0,0,0.7)" />
+            <text x={center.x} y={center.y + 14} fill={color} fontSize={11} fontWeight={500} textAnchor="middle">{perimLabel}</text>
+          </g>
+        )}
+      </g>
+    );
+  }
+
   // Render in-progress drawing
   function renderDrawing() {
-    if (mode !== "measure" || drawingPoints.length === 0) return null;
+    if ((mode !== "measure" && mode !== "area") || drawingPoints.length === 0) return null;
 
     const allPts = [...drawingPoints];
     const mouseTarget = measureMousePos;
+
+    // Area mode: show live polygon preview
+    if (mode === "area") {
+      const previewPts = mouseTarget ? [...allPts, mouseTarget] : allPts;
+      // Show close indicator when near first point
+      const nearFirst = mouseTarget && allPts.length >= 3 &&
+        ptDist(imageToOverlay(mouseTarget), imageToOverlay(allPts[0])) < SNAP_RADIUS;
+
+      return (
+        <g>
+          {renderAreaMeasurement("drawing", previewPts, false, true)}
+          {/* Closing indicator */}
+          {nearFirst && (() => {
+            const s = toSvg(allPts[0]);
+            return <circle cx={s.x} cy={s.y} r={10} fill="none" stroke="#a78bfa" strokeWidth={2} strokeDasharray="4 2" />;
+          })()}
+          {snapPoint && !nearFirst && (() => {
+            const s = toSvg(snapPoint);
+            return <circle cx={s.x} cy={s.y} r={8} fill="none" stroke="#f59e0b" strokeWidth={2} />;
+          })()}
+        </g>
+      );
+    }
+
+    // Line mode
     const color = "#22d3ee";
 
     return (
@@ -701,7 +840,7 @@ export default function PlanViewer() {
 
   const zoomPercent = Math.round(zoom * 100);
   const scale = scaleLabel();
-  const cursor = mode === "calibrate" || mode === "measure" ? "crosshair" : isPanning ? "grabbing" : "grab";
+  const cursor = mode === "calibrate" || mode === "measure" || mode === "area" ? "crosshair" : isPanning ? "grabbing" : "grab";
 
   return (
     <div className="flex h-screen flex-col bg-zinc-900 text-white select-none">
@@ -780,6 +919,15 @@ export default function PlanViewer() {
           >
             Line
           </button>
+          <button
+            onClick={() => switchMode(mode === "area" ? "pan" : "area")}
+            className={`rounded px-2 py-1 text-sm font-medium hover:bg-zinc-700 ${
+              mode === "area" ? "bg-purple-600 text-white" : "text-purple-400"
+            }`}
+            title="Area measurement (A)"
+          >
+            Area
+          </button>
 
           <div className="mx-1 h-4 w-px bg-zinc-600" />
           <button
@@ -830,7 +978,18 @@ export default function PlanViewer() {
           Click to add points. Double-click or Enter to finish. Ctrl+Z to undo last point.
         </div>
       )}
-      {mode === "measure" && selectedId && drawingPoints.length === 0 && (
+      {mode === "area" && drawingPoints.length === 0 && !selectedId && (
+        <div className="bg-purple-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+          Click to place polygon vertices. Click first point or Enter to close. Esc to cancel.
+          {!currentScale && " (Set scale first for real-world units)"}
+        </div>
+      )}
+      {mode === "area" && drawingPoints.length > 0 && (
+        <div className="bg-purple-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+          Click to add vertices. {drawingPoints.length >= 3 ? "Click first point or Enter to close shape." : "Need at least 3 points."} Ctrl+Z to undo.
+        </div>
+      )}
+      {(mode === "measure" || mode === "area") && selectedId && drawingPoints.length === 0 && (
         <div className="bg-blue-600/90 px-4 py-2 text-center text-sm font-medium text-white">
           Measurement selected. Press Delete to remove. Click elsewhere to deselect.
         </div>
@@ -914,7 +1073,8 @@ export default function PlanViewer() {
           <span className="mr-4">Drag to pan</span>
           <span className="mr-4"><kbd>F</kbd> Fit</span>
           <span className="mr-4"><kbd>0</kbd> 100%</span>
-          <span className="mr-4"><kbd>L</kbd> Line tool</span>
+          <span className="mr-4"><kbd>L</kbd> Line</span>
+          <span className="mr-4"><kbd>A</kbd> Area</span>
           <span className="mr-4"><kbd>&larr;&rarr;</kbd> Sheets</span>
           <span><kbd>S</kbd> Toggle panel</span>
         </div>

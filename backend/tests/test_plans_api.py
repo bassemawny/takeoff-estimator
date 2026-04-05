@@ -240,6 +240,62 @@ async def test_measurement_with_label(client, sample_pdf):
     assert resp.json()["label"] == "garage wall"
 
 
+# --- Area Measurements ---
+
+
+async def test_create_area_measurement(client, sample_pdf):
+    plan = await _upload(client, sample_pdf)
+
+    resp = await client.post(
+        f"/api/plans/{plan['id']}/pages/1/measurements",
+        json={
+            "type": "area",
+            "points": [[0, 0], [100, 0], [100, 100], [0, 100]],
+            "label": "garage floor",
+        },
+    )
+    assert resp.status_code == 200
+    m = resp.json()
+    assert m["type"] == "area"
+    assert len(m["points"]) == 4
+    assert m["label"] == "garage floor"
+
+
+async def test_area_and_line_coexist(client, sample_pdf):
+    plan = await _upload(client, sample_pdf)
+
+    await client.post(
+        f"/api/plans/{plan['id']}/pages/1/measurements",
+        json={"type": "line", "points": [[0, 0], [100, 0]]},
+    )
+    await client.post(
+        f"/api/plans/{plan['id']}/pages/1/measurements",
+        json={"type": "area", "points": [[0, 0], [50, 0], [50, 50], [0, 50]]},
+    )
+
+    resp = await client.get(f"/api/plans/{plan['id']}/pages/1/measurements")
+    items = resp.json()
+    assert len(items) == 2
+    types = {m["type"] for m in items}
+    assert types == {"line", "area"}
+
+
+async def test_delete_area_measurement(client, sample_pdf):
+    plan = await _upload(client, sample_pdf)
+
+    resp = await client.post(
+        f"/api/plans/{plan['id']}/pages/1/measurements",
+        json={"type": "area", "points": [[0, 0], [100, 0], [100, 100]]},
+    )
+    m_id = resp.json()["id"]
+
+    resp = await client.delete(f"/api/plans/{plan['id']}/pages/1/measurements/{m_id}")
+    assert resp.status_code == 200
+
+    resp = await client.get(f"/api/plans/{plan['id']}/pages/1/measurements")
+    assert len(resp.json()) == 0
+
+
 # --- Health ---
 
 
