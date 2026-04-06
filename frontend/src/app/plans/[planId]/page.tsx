@@ -12,6 +12,7 @@ import {
   listMeasurements,
   createMeasurement,
   deleteMeasurement as apiDeleteMeasurement,
+  updateMeasurement,
 } from "@/lib/api";
 
 const MIN_ZOOM = 0.1;
@@ -34,7 +35,20 @@ const AREA_UNIT_LABELS: Record<string, string> = {
 };
 
 type Point = { x: number; y: number };
-type Mode = "pan" | "calibrate" | "measure" | "area";
+type Mode = "pan" | "calibrate" | "measure" | "area" | "object";
+type ObjectType = "door" | "window" | "opening";
+
+const OBJECT_COLORS: Record<ObjectType, string> = {
+  door: "#f43f5e",
+  window: "#0ea5e9",
+  opening: "#f97316",
+};
+
+const OBJECT_LABELS: Record<ObjectType, string> = {
+  door: "Door",
+  window: "Window",
+  opening: "Opening",
+};
 
 // Compute distance between two image-space points
 function ptDist(a: Point, b: Point): number {
@@ -115,6 +129,8 @@ export default function PlanViewer() {
   // Tool mode
   const [mode, setMode] = useState<Mode>("pan");
   const [spaceHeld, setSpaceHeld] = useState(false);
+  const [objectType, setObjectType] = useState<ObjectType>("door");
+  const [hoveringMeasurement, setHoveringMeasurement] = useState(false);
 
   // Scale calibration state
   const [calPoint1, setCalPoint1] = useState<Point | null>(null);
@@ -266,7 +282,7 @@ export default function PlanViewer() {
       return;
     }
 
-    if (mode === "measure" || mode === "area") {
+    if (mode === "measure" || mode === "area" || mode === "object") {
       // Single click adds a point; don't start panning
       return;
     }
@@ -279,21 +295,20 @@ export default function PlanViewer() {
 
   function handleClick(e: React.MouseEvent) {
     if (spaceHeld) return; // suppress clicks while space-panning
-    if ((mode !== "measure" && mode !== "area") || showScaleDialog) return;
+    if (showScaleDialog) return;
+
+    // Pan mode: only allow selecting/deselecting existing measurements
+    if (mode === "pan") {
+      const clicked = findClickedMeasurement(e.clientX, e.clientY);
+      setSelectedId(clicked ? (clicked.id === selectedId ? null : clicked.id) : null);
+      return;
+    }
+
+    if (mode !== "measure" && mode !== "area" && mode !== "object") return;
 
     const rawPt = screenToImage(e.clientX, e.clientY);
     if (!rawPt) return;
     const pt = snapPoint || rawPt;
-
-    // If we're not drawing yet, check if user clicked on an existing measurement
-    if (drawingPoints.length === 0) {
-      const clicked = findClickedMeasurement(e.clientX, e.clientY);
-      if (clicked) {
-        setSelectedId(clicked.id === selectedId ? null : clicked.id);
-        return;
-      }
-      setSelectedId(null);
-    }
 
     // Area mode: close polygon when clicking near first point
     if (mode === "area" && drawingPoints.length >= 3) {
@@ -305,11 +320,24 @@ export default function PlanViewer() {
       }
     }
 
+    // Object mode: auto-finish after 2 points
+    if (mode === "object" && drawingPoints.length === 1) {
+      const allPts = [...drawingPoints, pt];
+      const points = allPts.map((p) => [p.x, p.y]);
+      createMeasurement(planId, currentPage, objectType, points)
+        .then((m) => setMeasurements((prev) => [...prev, m]))
+        .catch(() => {});
+      setDrawingPoints([]);
+      setMeasureMousePos(null);
+      setSnapPoint(null);
+      return;
+    }
+
     setDrawingPoints((prev) => [...prev, pt]);
   }
 
   function handleDoubleClick(e: React.MouseEvent) {
-    if (mode !== "measure" && mode !== "area") return;
+    if (mode !== "measure" && mode !== "area" && mode !== "object") return;
     e.preventDefault();
     finishMeasurement();
   }
@@ -327,7 +355,7 @@ export default function PlanViewer() {
       return;
     }
 
-    if (mode === "measure" || mode === "area") {
+    if (mode === "measure" || mode === "area" || mode === "object") {
       const pt = screenToImage(e.clientX, e.clientY);
       if (pt) {
         const snap = findSnapPoint(pt);
@@ -335,6 +363,12 @@ export default function PlanViewer() {
         setMeasureMousePos(snap || pt);
       }
       return;
+    }
+
+    // Pan mode: detect hovering over selectable measurements
+    if (mode === "pan") {
+      const hovering = !!findClickedMeasurement(e.clientX, e.clientY);
+      if (hovering !== hoveringMeasurement) setHoveringMeasurement(hovering);
     }
   }
 
@@ -349,16 +383,19 @@ export default function PlanViewer() {
 
     const threshold = 8 / zoom;
 
+    const objectTypes = ["door", "window", "opening"];
     for (const m of measurements) {
       const pts = m.points.map((p) => ({ x: p[0], y: p[1] }));
       // For areas, check if point is inside the polygon
       if (m.type === "area" && pointInPolygon(clickPt, pts)) return m;
       // Check edges (including closing edge for areas)
       const edgeCount = m.type === "area" ? pts.length : pts.length - 1;
+      // Object types are single-edge (2 points), use wider threshold
+      const objThreshold = objectTypes.includes(m.type) ? threshold * 2 : threshold;
       for (let i = 0; i < edgeCount; i++) {
         const a = pts[i];
         const b = pts[(i + 1) % pts.length];
-        if (pointToSegmentDist(clickPt, a, b) < threshold) return m;
+        if (pointToSegmentDist(clickPt, a, b) < objThreshold) return m;
       }
     }
     return null;
@@ -392,6 +429,7 @@ export default function PlanViewer() {
     cancelCalibration();
     cancelMeasurement();
     setSelectedId(null);
+    setHoveringMeasurement(false);
     setMode(newMode);
   }
 
@@ -433,7 +471,7 @@ export default function PlanViewer() {
     const minPoints = mode === "area" ? 3 : 2;
     if (drawingPoints.length < minPoints) return;
     const points = drawingPoints.map((p) => [p.x, p.y]);
-    const type = mode === "area" ? "area" : "line";
+    const type = mode === "object" ? objectType : mode === "area" ? "area" : "line";
     try {
       const m = await createMeasurement(planId, currentPage, type, points);
       setMeasurements((prev) => [...prev, m]);
@@ -486,13 +524,40 @@ export default function PlanViewer() {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.key === " ") return; // handled by space-to-pan
 
+      // Delete selected measurement from any mode
+      if ((e.key === "Delete" || e.key === "Backspace") && selectedId) {
+        e.preventDefault();
+        deleteSelected();
+        return;
+      }
+
+      // Door: R = swap hinge side, F = flip swing direction
+      if ((e.key === "r" || e.key === "f") && selectedId) {
+        const sel = measurements.find((m) => m.id === selectedId);
+        if (sel && sel.type === "door" && sel.points.length === 2) {
+          e.preventDefault();
+          const updates: { points?: number[][]; label?: string } = {};
+          if (e.key === "r") {
+            updates.points = [sel.points[1], sel.points[0]];
+          } else {
+            updates.label = sel.label === "flipped" ? "" : "flipped";
+          }
+          updateMeasurement(planId, currentPage, selectedId, updates)
+            .then((updated) => {
+              setMeasurements((prev) => prev.map((m) => m.id === updated.id ? updated : m));
+            })
+            .catch(() => {});
+          return;
+        }
+      }
+
       // Mode-specific
       if (mode === "calibrate" && e.key === "Escape") {
         e.preventDefault();
         switchMode("pan");
         return;
       }
-      if (mode === "measure" || mode === "area") {
+      if (mode === "measure" || mode === "area" || mode === "object") {
         if (e.key === "Escape") {
           e.preventDefault();
           if (drawingPoints.length > 0) {
@@ -508,15 +573,16 @@ export default function PlanViewer() {
           finishMeasurement();
           return;
         }
-        if ((e.key === "Delete" || e.key === "Backspace") && selectedId) {
-          e.preventDefault();
-          deleteSelected();
-          return;
-        }
         if (e.key === "z" && (e.metaKey || e.ctrlKey) && drawingPoints.length > 0) {
           e.preventDefault();
           setDrawingPoints((prev) => prev.slice(0, -1));
           return;
+        }
+        // Object subtype shortcuts
+        if (mode === "object") {
+          if (e.key === "1") { e.preventDefault(); setObjectType("door"); return; }
+          if (e.key === "2") { e.preventDefault(); setObjectType("window"); return; }
+          if (e.key === "3") { e.preventDefault(); setObjectType("opening"); return; }
         }
       }
 
@@ -561,6 +627,10 @@ export default function PlanViewer() {
           e.preventDefault();
           switchMode(mode === "area" ? "pan" : "area");
           break;
+        case "o":
+          e.preventDefault();
+          switchMode(mode === "object" ? "pan" : "object");
+          break;
         case "Escape":
           router.push("/");
           break;
@@ -570,7 +640,7 @@ export default function PlanViewer() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pages.length, zoomToFit, router, mode, drawingPoints, selectedId]);
+  }, [pages.length, zoomToFit, router, mode, drawingPoints, selectedId, objectType, measurements, planId, currentPage]);
 
   // Reset state when page changes
   useEffect(() => {
@@ -601,12 +671,17 @@ export default function PlanViewer() {
   function renderMeasurements() {
     if (measurements.length === 0) return null;
 
+    const objectTypes = ["door", "window", "opening"];
     return measurements.map((m) => {
       const isSelected = m.id === selectedId;
       const pts = m.points.map((p) => ({ x: p[0], y: p[1] }));
 
       if (m.type === "area") {
         return renderAreaMeasurement(m.id, pts, isSelected, false);
+      }
+
+      if (objectTypes.includes(m.type)) {
+        return renderObjectMeasurement(m.id, pts, m.type, isSelected, false, m.label);
       }
 
       // Line measurement
@@ -707,12 +782,116 @@ export default function PlanViewer() {
     );
   }
 
+  // Render a wall object (door/window/opening)
+  function renderObjectMeasurement(key: string, pts: Point[], type: string, isSelected: boolean, isDrawing: boolean, measurementLabel?: string) {
+    const objType = type as ObjectType;
+    const baseColor = OBJECT_COLORS[objType] || "#f43f5e";
+    const color = isSelected ? "#60a5fa" : baseColor;
+    const label = OBJECT_LABELS[objType] || type;
+    const labelScale = Math.min(1, zoom);
+    const flipped = measurementLabel === "flipped";
+
+    if (pts.length < 2) {
+      // Single point placed — show dot
+      const s = toSvg(pts[0]);
+      return (
+        <g key={key}>
+          <circle cx={s.x} cy={s.y} r={5} fill={color} stroke="white" strokeWidth={1} />
+        </g>
+      );
+    }
+
+    const s1 = toSvg(pts[0]);
+    const s2 = toSvg(pts[1]);
+    const mid = svgMidpoint(pts[0], pts[1]);
+    const widthLabel = formatDistance(ptDist(pts[0], pts[1]), currentScale);
+    const widthLabelW = widthLabel.length * 6.5 + 8;
+    const typeLabelW = label.length * 7 + 8;
+
+    // Compute perpendicular direction for tick marks (window) or arc (door)
+    const dx = s2.x - s1.x;
+    const dy = s2.y - s1.y;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    const nx = len > 0 ? -dy / len : 0; // perpendicular unit vector
+    const ny = len > 0 ? dx / len : 0;
+    const tickLen = 8;
+
+    return (
+      <g key={key}>
+        {/* Main line */}
+        <line
+          x1={s1.x} y1={s1.y} x2={s2.x} y2={s2.y}
+          stroke={color}
+          strokeWidth={isSelected ? 4 : 3}
+          strokeLinecap="round"
+          strokeDasharray={objType === "opening" ? "6 4" : undefined}
+        />
+
+        {/* Type-specific decorations */}
+        {objType === "door" && len > 0 && (() => {
+          // Quarter-circle arc from one endpoint, radius = door width
+          // flipped controls which side of the wall the door swings to
+          const sign = flipped ? -1 : 1;
+          const arcEndX = s1.x + nx * len * sign;
+          const arcEndY = s1.y + ny * len * sign;
+          const sweepFlag = flipped ? 0 : 1;
+          return (
+            <path
+              d={`M ${s2.x},${s2.y} A ${len},${len} 0 0,${sweepFlag} ${arcEndX},${arcEndY}`}
+              fill="none" stroke={color} strokeWidth={1.5} strokeDasharray="4 3"
+            />
+          );
+        })()}
+
+        {objType === "window" && (
+          <>
+            {/* Perpendicular ticks at each end */}
+            <line x1={s1.x - nx * tickLen} y1={s1.y - ny * tickLen} x2={s1.x + nx * tickLen} y2={s1.y + ny * tickLen} stroke={color} strokeWidth={2} strokeLinecap="round" />
+            <line x1={s2.x - nx * tickLen} y1={s2.y - ny * tickLen} x2={s2.x + nx * tickLen} y2={s2.y + ny * tickLen} stroke={color} strokeWidth={2} strokeLinecap="round" />
+            {/* Center line */}
+            <line x1={mid.x - nx * tickLen * 0.6} y1={mid.y - ny * tickLen * 0.6} x2={mid.x + nx * tickLen * 0.6} y2={mid.y + ny * tickLen * 0.6} stroke={color} strokeWidth={1.5} strokeLinecap="round" />
+          </>
+        )}
+
+        {/* Endpoints */}
+        <circle cx={s1.x} cy={s1.y} r={4} fill={color} stroke="white" strokeWidth={1} />
+        <circle cx={s2.x} cy={s2.y} r={4} fill={color} stroke="white" strokeWidth={1} />
+
+        {/* Width label */}
+        <g transform={`translate(${mid.x}, ${mid.y - 14}) scale(${labelScale}) translate(${-mid.x}, ${-(mid.y - 14)})`}>
+          <rect x={mid.x - widthLabelW / 2} y={mid.y - 22} width={widthLabelW} height={16} rx={3} fill="rgba(0,0,0,0.7)" />
+          <text x={mid.x} y={mid.y - 10} fill={color} fontSize={11} fontWeight={500} textAnchor="middle">{widthLabel}</text>
+        </g>
+
+        {/* Type label below */}
+        <g transform={`translate(${mid.x}, ${mid.y + 4}) scale(${labelScale}) translate(${-mid.x}, ${-(mid.y + 4)})`}>
+          <rect x={mid.x - typeLabelW / 2} y={mid.y + 2} width={typeLabelW} height={16} rx={3} fill="rgba(0,0,0,0.75)" />
+          <text x={mid.x} y={mid.y + 14} fill={color} fontSize={11} fontWeight={600} textAnchor="middle">{label}</text>
+        </g>
+      </g>
+    );
+  }
+
   // Render in-progress drawing
   function renderDrawing() {
-    if ((mode !== "measure" && mode !== "area") || drawingPoints.length === 0) return null;
+    if ((mode !== "measure" && mode !== "area" && mode !== "object") || drawingPoints.length === 0) return null;
 
     const allPts = [...drawingPoints];
     const mouseTarget = measureMousePos;
+
+    // Object mode: show in-progress line
+    if (mode === "object") {
+      const previewPts = mouseTarget ? [...allPts, mouseTarget] : allPts;
+      return (
+        <g>
+          {renderObjectMeasurement("drawing", previewPts, objectType, false, true)}
+          {snapPoint && (() => {
+            const s = toSvg(snapPoint);
+            return <circle cx={s.x} cy={s.y} r={8} fill="none" stroke="#f59e0b" strokeWidth={2} />;
+          })()}
+        </g>
+      );
+    }
 
     // Area mode: show live polygon preview
     if (mode === "area") {
@@ -905,8 +1084,10 @@ export default function PlanViewer() {
   const scale = scaleLabel();
   const cursor = spaceHeld
     ? (isPanning ? "grabbing" : "grab")
-    : (mode === "calibrate" || mode === "measure" || mode === "area") ? "crosshair"
-    : isPanning ? "grabbing" : "grab";
+    : (mode === "calibrate" || mode === "measure" || mode === "area" || mode === "object") ? "crosshair"
+    : isPanning ? "grabbing"
+    : hoveringMeasurement ? "default"
+    : "grab";
 
   return (
     <div className="flex h-screen flex-col bg-zinc-900 text-white select-none">
@@ -994,6 +1175,15 @@ export default function PlanViewer() {
           >
             Area
           </button>
+          <button
+            onClick={() => switchMode(mode === "object" ? "pan" : "object")}
+            className={`rounded px-2 py-1 text-sm font-medium hover:bg-zinc-700 ${
+              mode === "object" ? "bg-rose-600 text-white" : "text-rose-400"
+            }`}
+            title="Mark doors, windows, openings (O)"
+          >
+            Objects
+          </button>
 
           <div className="mx-1 h-4 w-px bg-zinc-600" />
           <button
@@ -1024,42 +1214,6 @@ export default function PlanViewer() {
           </button>
         </div>
       </div>
-
-      {/* Context banner */}
-      {mode === "calibrate" && !showScaleDialog && (
-        <div className="bg-amber-600/90 px-4 py-2 text-center text-sm font-medium text-white">
-          {!calPoint1
-            ? "Click the first point of a known dimension on the plan"
-            : "Click the second point to complete the line"}
-        </div>
-      )}
-      {mode === "measure" && drawingPoints.length === 0 && !selectedId && (
-        <div className="bg-emerald-600/90 px-4 py-2 text-center text-sm font-medium text-white">
-          Click to start measuring. Double-click or Enter to finish. Esc to cancel.
-          {!currentScale && " (Set scale first for real-world units)"}
-        </div>
-      )}
-      {mode === "measure" && drawingPoints.length > 0 && (
-        <div className="bg-emerald-600/90 px-4 py-2 text-center text-sm font-medium text-white">
-          Click to add points. Double-click or Enter to finish. Ctrl+Z to undo last point.
-        </div>
-      )}
-      {mode === "area" && drawingPoints.length === 0 && !selectedId && (
-        <div className="bg-purple-600/90 px-4 py-2 text-center text-sm font-medium text-white">
-          Click to place polygon vertices. Click first point or Enter to close. Esc to cancel.
-          {!currentScale && " (Set scale first for real-world units)"}
-        </div>
-      )}
-      {mode === "area" && drawingPoints.length > 0 && (
-        <div className="bg-purple-600/90 px-4 py-2 text-center text-sm font-medium text-white">
-          Click to add vertices. {drawingPoints.length >= 3 ? "Click first point or Enter to close shape." : "Need at least 3 points."} Ctrl+Z to undo.
-        </div>
-      )}
-      {(mode === "measure" || mode === "area") && selectedId && drawingPoints.length === 0 && (
-        <div className="bg-blue-600/90 px-4 py-2 text-center text-sm font-medium text-white">
-          Measurement selected. Press Delete to remove. Click elsewhere to deselect.
-        </div>
-      )}
 
       {/* Main area */}
       <div className="flex flex-1 overflow-hidden">
@@ -1127,6 +1281,65 @@ export default function PlanViewer() {
             {renderCalibrationOverlay()}
           </svg>
 
+          {/* Context banner — absolutely positioned to avoid layout shift */}
+          {mode === "calibrate" && !showScaleDialog && (
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-amber-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+              {!calPoint1
+                ? "Click the first point of a known dimension on the plan"
+                : "Click the second point to complete the line"}
+            </div>
+          )}
+          {mode === "measure" && drawingPoints.length === 0 && !selectedId && (
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-emerald-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+              Click to start measuring. Double-click or Enter to finish. Esc to cancel.
+              {!currentScale && " (Set scale first for real-world units)"}
+            </div>
+          )}
+          {mode === "measure" && drawingPoints.length > 0 && (
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-emerald-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+              Click to add points. Double-click or Enter to finish. Ctrl+Z to undo last point.
+            </div>
+          )}
+          {mode === "area" && drawingPoints.length === 0 && !selectedId && (
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-purple-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+              Click to place polygon vertices. Click first point or Enter to close. Esc to cancel.
+              {!currentScale && " (Set scale first for real-world units)"}
+            </div>
+          )}
+          {mode === "area" && drawingPoints.length > 0 && (
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-purple-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+              Click to add vertices. {drawingPoints.length >= 3 ? "Click first point or Enter to close shape." : "Need at least 3 points."} Ctrl+Z to undo.
+            </div>
+          )}
+          {mode === "object" && drawingPoints.length === 0 && !selectedId && (
+            <div className="pointer-events-auto absolute inset-x-0 top-0 z-10 flex items-center justify-center gap-3 bg-rose-600/90 px-4 py-2 text-sm font-medium text-white">
+              <span>Click to mark the start of the opening.</span>
+              <span className="mx-1 h-4 w-px bg-white/30" />
+              {(["door", "window", "opening"] as ObjectType[]).map((t, i) => (
+                <button
+                  key={t}
+                  onClick={(e) => { e.stopPropagation(); setObjectType(t); }}
+                  className={`rounded px-2 py-0.5 text-xs font-semibold ${objectType === t ? "bg-white/25" : "bg-white/10 hover:bg-white/15"}`}
+                >
+                  {i + 1}. {OBJECT_LABELS[t]}
+                </button>
+              ))}
+            </div>
+          )}
+          {mode === "object" && drawingPoints.length > 0 && (
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-center gap-3 bg-rose-600/90 px-4 py-2 text-sm font-medium text-white">
+              <span>Click the other end of the opening to finish.</span>
+              <span className="text-xs opacity-70">({OBJECT_LABELS[objectType]})</span>
+            </div>
+          )}
+          {selectedId && drawingPoints.length === 0 && (
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-blue-600/90 px-4 py-2 text-center text-sm font-medium text-white">
+              Measurement selected. Press Delete to remove.{" "}
+              {measurements.find((m) => m.id === selectedId)?.type === "door" && "R = move hinge, F = flip swing. "}
+              Click elsewhere to deselect.
+            </div>
+          )}
+
           {/* Scale dialog */}
           {renderScaleDialog()}
         </div>
@@ -1141,15 +1354,30 @@ export default function PlanViewer() {
           <span className="mr-4"><kbd>0</kbd> 100%</span>
           <span className="mr-4"><kbd>L</kbd> Line</span>
           <span className="mr-4"><kbd>A</kbd> Area</span>
+          <span className="mr-4"><kbd>O</kbd> Objects</span>
           <span className="mr-4"><kbd>&larr;&rarr;</kbd> Sheets</span>
           <span><kbd>S</kbd> Toggle panel</span>
         </div>
         <div className="flex items-center gap-4">
-          {measurements.length > 0 && (
-            <span className="text-emerald-500/70">
-              {measurements.length} measurement{measurements.length !== 1 ? "s" : ""}
-            </span>
-          )}
+          {(() => {
+            const objectTypes = ["door", "window", "opening"];
+            const objCount = measurements.filter((m) => objectTypes.includes(m.type)).length;
+            const measCount = measurements.length - objCount;
+            return (
+              <>
+                {measCount > 0 && (
+                  <span className="text-emerald-500/70">
+                    {measCount} measurement{measCount !== 1 ? "s" : ""}
+                  </span>
+                )}
+                {objCount > 0 && (
+                  <span className="text-rose-500/70">
+                    {objCount} object{objCount !== 1 ? "s" : ""}
+                  </span>
+                )}
+              </>
+            );
+          })()}
           {currentScale && (
             <span className="text-amber-500/70">
               Scale: {currentScale.real_distance} {UNIT_LABELS[currentScale.unit] || currentScale.unit} per {Math.round(currentScale.pixel_distance)} px
